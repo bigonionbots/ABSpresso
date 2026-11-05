@@ -37,6 +37,8 @@ phone needed.
 - **Battery aware**: battery level and charging state in the status row, a dimming screen, screen
   off, and deep sleep when idle.
 - **Physical controls**: BOOT plays and pauses, or puts the device to sleep when held.
+- **Bluetooth headphones (optional)**: through an [ATOM Lite audio module](#bluetooth-headphones-atom-lite-audio-module)
+  wired to the UART header. Pick headphones in Settings; progress, pause and volume work as on the speaker.
 - Accented characters, Cyrillic and Vietnamese titles display correctly.
 
 ## Screenshots
@@ -144,9 +146,8 @@ and asks you to sign in again only if the server ends the session.
 
 ## Possible next features
 
-- **Bluetooth audio**: the ESP32-S3 only has Bluetooth Low Energy, not the Classic Bluetooth
-  (A2DP) that ordinary headphones use. It would need an external A2DP module, or a different
-  chip. A Bluetooth Low Energy remote (play/pause from a button or watch) is possible on this one.
+- **Bluetooth remote**: a Bluetooth Low Energy remote (play/pause from a button or watch). Bluetooth
+  headphones already work through the [audio module](#bluetooth-headphones-atom-lite-audio-module).
 - **Better battery readings**: calibrate the voltage curve against a real discharge, and detect
   charging directly (the charger's status pin isn't connected to the ESP32 on this board).
 - **Sleep timer** and **playback speed** on Now Playing.
@@ -204,6 +205,39 @@ bus. V2 has an ES8311 codec (I2C 0x18) and ES7210 microphone ADC (0x40), needs M
 gates its amplifier with GPIO15. `board_audio_init()` probes for the ES8311 at start-up and
 configures whichever is present; the log shows `audio: V1 board (PCM5101)` or
 `audio: V2 board (ES8311)`. On both, volume is applied in software (the ES8311 is left at 0 dB).
+
+### Bluetooth headphones (ATOM Lite audio module)
+
+The ESP32-S3 only has Bluetooth Low Energy, not the Classic Bluetooth (A2DP) that ordinary
+headphones use. An M5Stack ATOM Lite (an original ESP32, which has it) running the
+[atom-lite-audio-module](https://github.com/bigonionbots/atom-lite-audio-module) firmware plays
+the audio instead: ABSpresso sends it the book's AAC or MP3 undecoded, and the module decodes it
+and streams it to the headphones. The module can also play to a wired PCM5102A DAC.
+
+**Wiring**, the board's UART header to the ATOM's Grove port:
+
+| ABSpresso UART header | ATOM Lite Grove |
+| --- | --- |
+| TXD (GPIO43) | G32 (module RX) |
+| RXD (GPIO44) | G26 (module TX) |
+| GND | GND |
+
+Power the ATOM from its own USB-C, or from its 5V pin. The header's 3V3 pin is not meant to
+supply the ATOM's 5V input, and Bluetooth Classic draws over 100 mA at peaks.
+
+**Using it:** Settings → Device → **Audio out** cycles Speaker → Bluetooth → Wired (module). With
+Bluetooth chosen, **Headphones** opens the picker: put the headphones in pairing mode, tap Scan,
+then tap them in the list. The module remembers them and reconnects on its own. A book that is
+playing carries on through the new output.
+
+**How it works:** the link is UART0 at 500000 baud, 8N1, speaking the module's protocol
+(`main/module/AudioLinkProtocol.h`, a verbatim copy of the module repo's). It has CRC-checked
+frames, go-back-N resends and credit-based flow control. The player fetches segments exactly as
+before. Instead of decoding them, `app/ts_audio.c` pulls the AAC (already ADTS-framed in MPEG-TS)
+or MP3 out of the TS packets and the player sends it in 512-byte chunks. Starting mid-segment
+drops whole audio frames, which is accurate to about 23 ms. The position comes from the module's
+STATUS (`playedMs` since the stream started). Pause and volume are module commands. If the module
+reboots or is unplugged, the stream restarts at the last reported position when it is back.
 
 ### How playback works
 
@@ -267,7 +301,8 @@ main/
   main.c                 startup: display, Wi-Fi, library load, refresh loop
   hardware/              board bring-up, battery, power (dim/off/sleep, BOOT button), SD card
   network/               Wi-Fi, setup portal, Audiobookshelf REST client
-  app/                   settings (NVS), library catalog and cache, covers, downloads, player, text helpers
+  module/                ATOM Lite audio module link (Bluetooth headphones), protocol header
+  app/                   settings (NVS), library catalog and cache, covers, downloads, player, TS demux, text helpers
   ui/                    UI shell, PSRAM allocator for LVGL, generated fonts, screenshot capture
     widgets/             cover carousel, switcher pill, status row
     pages/               Home, Library, Now Playing, Settings, setup screen, book details, episodes

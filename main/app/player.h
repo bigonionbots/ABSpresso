@@ -43,5 +43,7 @@ void player_seek_to(double seconds);
 void player_chapter_step(int delta);
 void player_stop(void);
 void player_set_volume(int volume);
+// The audio output (speaker or audio module) changed: a playing book carries on through the new one.
+void player_output_changed(void);
 
 void player_get_status(player_status_t *out);

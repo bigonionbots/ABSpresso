@@ -102,6 +102,10 @@ void settings_refresh(void);
 void settings_libraries_changed(void);
 void libpicker_build(lv_obj_t *scr);
 bool libpicker_visible(void);
+// Bluetooth headphones picker (audio module), opened from Settings.
+void btpicker_build(lv_obj_t *scr);
+bool btpicker_visible(void);
+void btpicker_refresh(void);
 
 /* setup screen (ui_setup.c) */
 void setup_build(lv_obj_t *scr);

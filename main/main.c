@@ -7,6 +7,7 @@
 #include "esp_lvgl_port.h"
 #include "nvs_flash.h"
 #include "abs_api.h"
+#include "audio_module.h"
 #include "board.h"
 #include "cover.h"
 #include "player.h"
@@ -53,6 +54,7 @@ void app_main(void)
     battery_init();
     power_init();
     abs_api_init();
+    audio_module_init();  // before the player: it reads which output to use
     cover_init();
     player_init();
     download_init();

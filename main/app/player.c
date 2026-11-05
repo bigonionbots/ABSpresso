@@ -6,9 +6,13 @@
 //
 //   fetch task:  HTTPS segment GETs -> stream buffer (PSRAM)
 //   decode task: stream buffer -> TS demux + AAC/MP3 decode -> I2S
+//                or, with the audio module as the output: stream buffer -> TS demux (ts_audio.c)
+//                -> the undecoded AAC/MP3 over the module link; the module decodes and plays it
 //   control task: commands, session lifecycle, progress sync, status
 
 #include "player.h"
+#include "audio_module.h"
+#include "ts_audio.h"
 
 #include <math.h>
 #include <string.h>
@@ -44,6 +48,8 @@ typedef enum {
     CMD_SEEK_ABS,
     CMD_CHAPTER,
     CMD_STOP,
+    CMD_OUTPUT,  // the audio output changed: restart the stream on the new one
+    CMD_WAKE,    // nothing; wakes the control task (e.g. to send the module a new volume)
 } cmd_type_t;
 
 typedef struct {
@@ -77,6 +83,16 @@ static double s_skip_seconds;
 static volatile bool s_fetch_done, s_fetch_failed, s_decode_done, s_underrun, s_audio_started;
 static volatile int64_t s_frames;   // frames decoded since the start segment
 static volatile int s_rate;
+
+// Audio module output. s_to_module, s_mod_stream and s_mod_session are set with the pipeline
+// parameters; the decode task sets s_mod_start once the stream is under way.
+static bool s_to_module;
+static uint8_t s_mod_stream;
+static uint32_t s_mod_session;
+static volatile double s_mod_start;    // book time the module's stream starts at; < 0 until sent
+static volatile bool s_mod_lost;       // the module link restarted under the stream
+static double s_mod_played;            // control task: last played time the module reported
+#define MODULE_SEND_TIMEOUT_MS 200
 
 #ifdef PLAYER_STATUS_LOG
 static volatile uint32_t s_dbg_bytes_in, s_dbg_dec_err, s_dbg_write_max_us, s_dbg_underruns;
@@ -342,6 +358,129 @@ out:
     esp_audio_simple_dec_close(dec);
 }
 
+/* ---------- decode: audio module ---------- */
+
+typedef struct {
+    ts_audio_t ts;
+    uint8_t chunk[AM_AUDIO_CHUNK];
+    size_t fill;
+    bool started;
+} mod_ctx_t;
+
+static bool mod_link_lost(void)
+{
+    if (audio_module_session() == s_mod_session) return false;
+    s_mod_lost = true;
+    return true;
+}
+
+static bool mod_send(const uint8_t *data, size_t len)
+{
+    while (!s_abort && !mod_link_lost()) {
+        if (audio_module_send_audio(s_mod_stream, data, len, MODULE_SEND_TIMEOUT_MS)) return true;
+        // Timed out: the module's buffer is full (playing, or paused). Keep waiting.
+    }
+    return false;
+}
+
+// Retries a command until it gets through, the link restarts or playback is aborted.
+static bool mod_command(bool (*fn)(uint8_t), uint8_t stream)
+{
+    while (!s_abort && !mod_link_lost()) {
+        if (fn(stream)) return true;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    return false;
+}
+
+static bool mod_start_stream(mod_ctx_t *c)
+{
+    // The stream starts where skipping stopped (to the nearest audio frame of s_skip_seconds).
+    const double start = s_seg_start_time + c->ts.skipped;
+    const am_codec_t codec = c->ts.codec == TS_AUDIO_AAC ? AM_CODEC_AAC_ADTS : AM_CODEC_MP3;
+    while (!s_abort && !mod_link_lost()) {
+        // The module's pause state is global; make sure it matches ours before the stream starts.
+        if (audio_module_pause(s_paused) && audio_module_stream_start(s_mod_stream, codec, (uint32_t)(start * 1000))) {
+            s_mod_start = start;
+            c->started = true;
+            ESP_LOGI(TAG, "module stream %u: %s from %.2f s", s_mod_stream, codec == AM_CODEC_AAC_ADTS ? "AAC" : "MP3",
+                     start);
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    return false;
+}
+
+// ts_audio output: the audio elementary stream, sent in AM_AUDIO_CHUNK pieces.
+static bool mod_out(void *arg, const uint8_t *data, size_t len)
+{
+    mod_ctx_t *c = arg;
+    if (!c->started && !mod_start_stream(c)) return false;
+    while (len > 0) {
+        size_t n = AM_AUDIO_CHUNK - c->fill;
+        if (n > len) n = len;
+        memcpy(c->chunk + c->fill, data, n);
+        c->fill += n;
+        data += n;
+        len -= n;
+        if (c->fill == AM_AUDIO_CHUNK) {
+            if (!mod_send(c->chunk, c->fill)) return false;
+            c->fill = 0;
+        }
+    }
+    return true;
+}
+
+static bool mod_stream_finished(void)
+{
+    am_status_t st;
+    audio_module_get_status(&st);
+    return st.valid && st.stream_id == s_mod_stream && st.play_state == AM_PLAY_FINISHED;
+}
+
+static void module_run(uint8_t *in, int in_len)
+{
+    static mod_ctx_t ctx;  // decode task only
+    mod_ctx_t *c = &ctx;
+    memset(c, 0, sizeof(*c));
+    ts_audio_init(&c->ts, s_skip_seconds);
+
+    // Wait for the module (it may still be booting, or not plugged in yet).
+    am_status_t st;
+    for (audio_module_get_status(&st); !st.ready && !s_abort; audio_module_get_status(&st)) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    s_mod_session = audio_module_session();
+
+    while (!s_abort && !s_mod_lost) {
+        size_t n = xStreamBufferReceive(s_sbuf, in, in_len, pdMS_TO_TICKS(50));
+        if (n > 0) {
+#ifdef PLAYER_STATUS_LOG
+            s_dbg_bytes_in += n;
+#endif
+            if (!ts_audio_feed(&c->ts, in, n, mod_out, c)) break;
+            continue;
+        }
+        mod_link_lost();
+        if (!s_fetch_done) continue;
+
+        // Everything fetched and sent on: let the module play out what it has.
+        if (c->fill && !mod_send(c->chunk, c->fill)) break;
+        c->fill = 0;
+        if (!c->started) {  // no audio at all (e.g. skipped past the end)
+            s_decode_done = true;
+            return;
+        }
+        if (!mod_command(audio_module_stream_end, s_mod_stream)) break;
+        while (!s_abort && !mod_link_lost() && !mod_stream_finished()) vTaskDelay(pdMS_TO_TICKS(100));
+        if (!s_abort && !s_mod_lost) s_decode_done = true;
+        return;
+    }
+    // Stopped (seek, stop, new book) or the link restarted: drop what the module still holds.
+    if (c->started && !s_mod_lost) audio_module_stream_stop(s_mod_stream);
+}
+
 static void decode_task(void *arg)
 {
     const int in_len = 4096;
@@ -351,7 +490,8 @@ static void decode_task(void *arg)
     for (;;) {
         xEventGroupSetBits(s_idle, BIT_DECODE_IDLE);
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        decode_run(in, in_len, &pcm, &pcm_len);
+        if (s_to_module) module_run(in, in_len);
+        else decode_run(in, in_len, &pcm, &pcm_len);
     }
 }
 
@@ -366,6 +506,14 @@ static void pipeline_stop(void)
 
 static double current_position(void)
 {
+    if (s_to_module) {
+        const double start = s_mod_start;
+        if (start < 0) return s_seg_start_time + s_skip_seconds;
+        am_status_t st;
+        audio_module_get_status(&st);
+        if (st.valid && st.stream_id == s_mod_stream) s_mod_played = st.played_ms / 1000.0;
+        return start + s_mod_played;
+    }
     int rate = s_rate;
     return rate ? s_seg_start_time + (double)s_frames / rate : s_seg_start_time + s_skip_seconds;
 }
@@ -383,6 +531,16 @@ static void pipeline_start(double t)
     s_skip_seconds = t - s_seg_start_time;
     s_frames = 0;
     s_rate = 0;
+    s_to_module = audio_module_enabled();
+    if (s_to_module) {
+        static uint8_t last_stream;
+        last_stream = last_stream == 255 ? 1 : last_stream + 1;  // the module reports 0 for "no stream"
+        s_mod_stream = last_stream;
+        s_mod_start = -1;
+        s_mod_played = 0;
+        s_mod_lost = false;
+        board_audio_close();  // in case the speaker was playing until now
+    }
     s_fetch_done = s_fetch_failed = s_decode_done = s_audio_started = false;
     s_underrun = true;
     ESP_LOGI(TAG, "play from %.1f s (segment %d of %d)", t, s_start_seg, s_last_seg);
@@ -430,6 +588,14 @@ static void update_status(void)
     s_status.buffer_percent = s_sbuf ? (int)(100 * xStreamBufferBytesAvailable(s_sbuf) / STREAM_BUF_SIZE) : 0;
 
     player_state_t st = s_status.state;
+    if (s_to_module && (st == PLAYER_PLAYING || st == PLAYER_BUFFERING)) {
+        // Playing or waiting is what the module says it is doing with our stream.
+        am_status_t m;
+        audio_module_get_status(&m);
+        const bool ours = s_mod_start >= 0 && m.valid && m.stream_id == s_mod_stream;
+        if (ours && (m.play_state == AM_PLAY_PLAYING || m.play_state == AM_PLAY_DRAINING)) s_audio_started = true;
+        s_underrun = !ours || m.play_state == AM_PLAY_BUFFERING;
+    }
     if (st == PLAYER_PLAYING || st == PLAYER_BUFFERING) {
         if (s_fetch_failed) {
             st = PLAYER_ERROR;
@@ -659,6 +825,38 @@ static void handle(const cmd_t *c)
         set_state(PLAYER_IDLE);
         break;
 
+    case CMD_OUTPUT:
+        if (s_have_session && st != PLAYER_FINISHED && st != PLAYER_ERROR) seek_to(current_position());
+        break;
+
+    case CMD_WAKE:
+        break;
+
+    }
+}
+
+// Keeps the module's pause state and volume in step with ours (control task). Both are resent
+// when the link reconnects, as the module may have rebooted.
+static void module_sync(void)
+{
+    static uint32_t session;
+    static int volume = -1, paused = -1;
+    if (!audio_module_enabled()) return;
+    const uint32_t now_session = audio_module_session();
+    if (now_session != session) {
+        session = now_session;
+        volume = paused = -1;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const int want_volume = s_status.volume;
+    xSemaphoreGive(s_lock);
+    if (want_volume != volume && audio_module_set_volume(want_volume)) volume = want_volume;
+    if (s_to_module && (int)s_paused != paused && audio_module_pause(s_paused)) paused = s_paused;
+
+    if (s_to_module && s_mod_lost && s_have_session) {
+        ESP_LOGW(TAG, "audio module link restarted, resuming the stream");
+        s_mod_lost = false;
+        seek_to(current_position());
     }
 }
 
@@ -670,6 +868,7 @@ static void control_task(void *arg)
         if (xQueueReceive(s_cmds, &c, pdMS_TO_TICKS(250))) {
             handle(&c);
         }
+        module_sync();
         update_status();
 
         int64_t now = esp_timer_get_time();
@@ -793,7 +992,12 @@ void player_set_volume(int volume)
     s_status.volume = volume;
     s_volume_changed_us = esp_timer_get_time();
     xSemaphoreGive(s_lock);
+    // The control task sends it to the module. Only nudge an idle queue: a drag sends many of
+    // these, and they mustn't crowd out real commands.
+    if (audio_module_enabled() && uxQueueMessagesWaiting(s_cmds) == 0) post(CMD_WAKE, 0);
 }
+
+void player_output_changed(void) { post(CMD_OUTPUT, 0); }
 
 static void save_volume_if_settled(int64_t now)
 {

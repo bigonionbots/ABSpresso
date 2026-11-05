@@ -1,16 +1,21 @@
 // Settings page: two views, chosen with the switcher pill at the bottom (as on Home and Library).
 // Server: the Audiobookshelf connection, the library (switch and refresh) and Wi-Fi & login setup.
-// Device: screen, power and playback preferences, SD card and firmware info.
+// Device: screen, power and playback preferences, audio output, SD card and firmware info.
+//
+// Audio out cycles Speaker -> Bluetooth -> Wired; the last two play through the ATOM Lite audio
+// module (module/audio_module.h). Headphones opens the Bluetooth picker (scan, connect, forget).
 
 #include <stdio.h>
 #include <string.h>
 #include "abs_api.h"
+#include "audio_module.h"
 #include "board.h"
 #include "config.h"
 #include "download.h"
 #include "esp_app_desc.h"
 #include "esp_wifi.h"
 #include "nvs.h"
+#include "player.h"
 #include "power.h"
 #include "storage.h"
 #include "switcher.h"
@@ -25,20 +30,23 @@ static const char *const s_names[VIEW_COUNT] = {"Server", "Device"};
 enum {
     ROW_SERVER, ROW_USER, ROW_LIBRARY, ROW_CONTENTS, ROW_UPDATED, ROW_WIFI,  // Server
     ROW_BRIGHT, ROW_SCREEN, ROW_SLEEP, ROW_SKIP_BACK, ROW_SKIP_FWD,           // Device: cycle
-    ROW_ROTATE, ROW_BLUETOOTH,                                               // Device: toggles
+    ROW_AUDIO, ROW_HEADSET,                                                  // Device: audio output
+    ROW_ROTATE,                                                              // Device: toggle
     ROW_SD, ROW_VERSION,                                                     // Device: info
     ROW_COUNT
 };
 static const char *const s_keys[ROW_COUNT] = {
     "Server", "Signed in", "Library", "Contents", "Updated", "Wi-Fi",
     "Brightness", "Screen off", "Sleep", "Skip back", "Skip forward",
-    "Rotate 180\xc2\xb0", "Bluetooth",
+    "Audio out", "Headphones",
+    "Rotate 180\xc2\xb0",
     "SD card", "Firmware",
 };
 static const view_t s_row_view[ROW_COUNT] = {
     VIEW_SERVER, VIEW_SERVER, VIEW_SERVER, VIEW_SERVER, VIEW_SERVER, VIEW_SERVER,
     VIEW_DEVICE, VIEW_DEVICE, VIEW_DEVICE, VIEW_DEVICE, VIEW_DEVICE,
     VIEW_DEVICE, VIEW_DEVICE,
+    VIEW_DEVICE,
     VIEW_DEVICE, VIEW_DEVICE,
 };
 
@@ -91,6 +99,21 @@ static void on_cycle_row(lv_event_t *e)
         config_set_skip(cfg->skip_back_s, next_choice(SKIP_S, 4, cfg->skip_fwd_s));
         settings_refresh();
         return;
+    case ROW_AUDIO: {
+        // Speaker -> module Bluetooth -> module wired -> speaker.
+        const bool was_module = audio_module_enabled();
+        if (!was_module) {
+            audio_module_set_output(AM_OUT_BLUETOOTH);
+            audio_module_set_enabled(true);
+        } else if (audio_module_output() == AM_OUT_BLUETOOTH) {
+            audio_module_set_output(AM_OUT_I2S);
+        } else {
+            audio_module_set_enabled(false);
+        }
+        if (audio_module_enabled() != was_module) player_output_changed();
+        settings_refresh();
+        return;
+    }
     }
     power_set_config(&c);
     settings_refresh();
@@ -186,6 +209,175 @@ void libpicker_build(lv_obj_t *scr)
     lv_obj_add_flag(s_picker, LV_OBJ_FLAG_HIDDEN);
 }
 
+/* ---------- Bluetooth headphones picker ---------- */
+
+#define BT_LIST_MAX 16
+
+static lv_obj_t *s_bt, *s_bt_status, *s_bt_list, *s_bt_scan_label;
+static am_bt_device_t s_bt_devices[BT_LIST_MAX];
+static int s_bt_count = -1;      // devices in the list as built (-1: rebuild)
+static uint32_t s_bt_names;      // total name length as built, to notice names arriving
+static bool s_bt_scanning;       // we asked the module to scan
+
+static void format_address(const uint8_t a[6], char *buf, size_t len)
+{
+    snprintf(buf, len, "%02X:%02X:%02X:%02X:%02X:%02X", a[0], a[1], a[2], a[3], a[4], a[5]);
+}
+
+// "Sony WH-1000XM4", or the address when no scan has named it.
+static void headset_name(const uint8_t a[6], char *buf, size_t len)
+{
+    if (!audio_module_bt_name(a, buf, len)) format_address(a, buf, len);
+}
+
+static bool address_set(const uint8_t a[6])
+{
+    for (int i = 0; i < 6; i++) {
+        if (a[i]) return true;
+    }
+    return false;
+}
+
+static void bt_set_scan(bool on)
+{
+    s_bt_scanning = on;
+    if (on) {
+        audio_module_bt_clear();
+        s_bt_count = -1;
+    }
+    audio_module_bt_scan(on);
+    lv_label_set_text(s_bt_scan_label, on ? LV_SYMBOL_STOP "  Stop" : LV_SYMBOL_REFRESH "  Scan");
+}
+
+static void bt_close(void)
+{
+    if (s_bt_scanning) bt_set_scan(false);
+    lv_obj_add_flag(s_bt, LV_OBJ_FLAG_HIDDEN);
+    settings_refresh();
+}
+
+static void on_bt_close(lv_event_t *e) { bt_close(); }
+static void on_bt_scan(lv_event_t *e) { bt_set_scan(!s_bt_scanning); }
+
+static void on_bt_forget(lv_event_t *e)
+{
+    audio_module_bt_forget();
+}
+
+static void on_bt_pick(lv_event_t *e)
+{
+    const int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= s_bt_count) return;
+    s_bt_scanning = false;  // connecting stops the module's scan
+    lv_label_set_text(s_bt_scan_label, LV_SYMBOL_REFRESH "  Scan");
+    audio_module_bt_connect(s_bt_devices[i].address);
+}
+
+static void bt_rebuild_list(int count)
+{
+    lv_obj_clean(s_bt_list);
+    s_bt_count = count;
+    s_bt_names = 0;
+    for (int i = 0; i < count; i++) {
+        const am_bt_device_t *d = &s_bt_devices[i];
+        s_bt_names += strlen(d->name);
+        lv_obj_t *btn = lv_list_add_button(s_bt_list, NULL, NULL);
+        lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_bg_color(btn, COLOR_CARD, 0);
+        lv_obj_set_style_bg_color(btn, COLOR_ACCENT, LV_STATE_PRESSED);
+        lv_obj_set_style_radius(btn, 12, 0);
+        lv_obj_set_style_border_width(btn, 0, 0);
+        lv_obj_set_style_pad_all(btn, 8, 0);
+        lv_obj_t *t = lv_label_create(btn);
+        char addr[24];
+        format_address(d->address, addr, sizeof(addr));
+        lv_label_set_text(t, d->name[0] ? d->name : addr);
+        ui_one_line(t, &ui_font_16);
+        lv_obj_set_style_text_color(t, COLOR_TEXT, 0);
+        lv_obj_add_event_cb(btn, on_bt_pick, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    }
+}
+
+void btpicker_refresh(void)
+{
+    am_status_t st;
+    audio_module_get_status(&st);
+    char buf[64], name[40];
+    if (!st.ready) {
+        snprintf(buf, sizeof(buf), "Audio module not found");
+    } else if (!st.valid) {
+        snprintf(buf, sizeof(buf), "Connecting to the module...");
+    } else if (st.bt_state == AM_BT_CONNECTED) {
+        headset_name(st.bt_address, name, sizeof(name));
+        snprintf(buf, sizeof(buf), LV_SYMBOL_OK " %s", name);
+    } else if (st.bt_state == AM_BT_CONNECTING) {
+        snprintf(buf, sizeof(buf), "Connecting...");
+    } else if (st.bt_state == AM_BT_SCANNING || s_bt_scanning) {
+        snprintf(buf, sizeof(buf), "Put the headphones in pairing mode");
+    } else if (address_set(st.bt_address)) {
+        headset_name(st.bt_address, name, sizeof(name));
+        snprintf(buf, sizeof(buf), "Waiting for %s", name);
+    } else {
+        snprintf(buf, sizeof(buf), "Tap Scan to find headphones");
+    }
+    if (strcmp(lv_label_get_text(s_bt_status), buf) != 0) lv_label_set_text(s_bt_status, buf);
+
+    const int count = audio_module_bt_devices(s_bt_devices, BT_LIST_MAX);
+    uint32_t names = 0;
+    for (int i = 0; i < count; i++) names += strlen(s_bt_devices[i].name);
+    if (count != s_bt_count || names != s_bt_names) bt_rebuild_list(count);
+}
+
+bool btpicker_visible(void)
+{
+    return s_bt && !lv_obj_has_flag(s_bt, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void on_headset_row(lv_event_t *e)
+{
+    if (!audio_module_enabled() || audio_module_output() != AM_OUT_BLUETOOTH) return;
+    s_bt_count = -1;
+    btpicker_refresh();
+    lv_obj_remove_flag(s_bt, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_bt);
+}
+
+static lv_obj_t *make_button(lv_obj_t *parent, int w, const char *text, bool primary, lv_event_cb_t cb);
+
+void btpicker_build(lv_obj_t *scr)
+{
+    s_bt = ui_page_container(scr);
+    lv_obj_set_style_bg_color(s_bt, COLOR_BG, 0);
+    lv_obj_set_style_bg_opa(s_bt, LV_OPA_COVER, 0);
+    lv_obj_add_flag(s_bt, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *close = ui_round_button(s_bt, 36, LV_SYMBOL_CLOSE, &ui_font_16, on_bt_close, NULL);
+    lv_obj_align(close, LV_ALIGN_CENTER, 0, -128);
+    lv_obj_t *title = ui_label(s_bt, &ui_font_16, COLOR_ACCENT, 220);
+    lv_label_set_text(title, LV_SYMBOL_BLUETOOTH "  Headphones");
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, -92);
+    s_bt_status = ui_label(s_bt, &ui_font_14, COLOR_MUTED, 250);
+    lv_label_set_long_mode(s_bt_status, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_label_set_text(s_bt_status, "");
+    lv_obj_align(s_bt_status, LV_ALIGN_CENTER, 0, -68);
+
+    lv_obj_t *scan = make_button(s_bt, 112, LV_SYMBOL_REFRESH "  Scan", true, on_bt_scan);
+    lv_obj_align(scan, LV_ALIGN_CENTER, -60, -32);
+    s_bt_scan_label = lv_obj_get_child(scan, 0);
+    lv_obj_t *forget = make_button(s_bt, 112, LV_SYMBOL_TRASH "  Forget", false, on_bt_forget);
+    lv_obj_align(forget, LV_ALIGN_CENTER, 60, -32);
+
+    s_bt_list = lv_list_create(s_bt);
+    lv_obj_set_size(s_bt_list, 240, 166);
+    lv_obj_align(s_bt_list, LV_ALIGN_CENTER, 0, 72);
+    lv_obj_set_style_bg_opa(s_bt_list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_bt_list, 0, 0);
+    lv_obj_set_style_pad_all(s_bt_list, 0, 0);
+    lv_obj_set_style_pad_row(s_bt_list, 6, 0);
+    lv_obj_set_scrollbar_mode(s_bt_list, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_flag(s_bt, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void on_refresh(lv_event_t *e)
 {
     ui_request_refresh();
@@ -263,6 +455,22 @@ static void refresh_device(void)
     set_value(ROW_SKIP_BACK, buf);
     snprintf(buf, sizeof(buf), "%d s  " LV_SYMBOL_RIGHT, config_get()->skip_fwd_s);
     set_value(ROW_SKIP_FWD, buf);
+
+    am_status_t am;
+    audio_module_get_status(&am);
+    const bool module = audio_module_enabled();
+    const bool bt = module && audio_module_output() == AM_OUT_BLUETOOTH;
+    snprintf(buf, sizeof(buf), "%s  " LV_SYMBOL_RIGHT, !module ? "Speaker" : bt ? "Bluetooth" : "Wired (module)");
+    set_value(ROW_AUDIO, buf);
+    char name[40];
+    if (!bt) snprintf(buf, sizeof(buf), "-");
+    else if (!am.ready) snprintf(buf, sizeof(buf), "no module  " LV_SYMBOL_RIGHT);
+    else if (am.valid && am.bt_state == AM_BT_CONNECTED) {
+        headset_name(am.bt_address, name, sizeof(name));
+        snprintf(buf, sizeof(buf), "%s  " LV_SYMBOL_RIGHT, name);
+    } else if (am.valid && am.bt_state == AM_BT_CONNECTING) snprintf(buf, sizeof(buf), "connecting  " LV_SYMBOL_RIGHT);
+    else snprintf(buf, sizeof(buf), "not connected  " LV_SYMBOL_RIGHT);
+    set_value(ROW_HEADSET, buf);
     if (lv_obj_has_state(s_rotate_sw, LV_STATE_CHECKED) != s_rotated) {
         if (s_rotated) lv_obj_add_state(s_rotate_sw, LV_STATE_CHECKED);
         else lv_obj_remove_state(s_rotate_sw, LV_STATE_CHECKED);
@@ -384,19 +592,13 @@ static void build_device(lv_obj_t *v)
         if (i == ROW_ROTATE) {
             s_rotate_sw = add_switch(row);
             lv_obj_add_event_cb(s_rotate_sw, on_rotate, LV_EVENT_VALUE_CHANGED, NULL);
-        } else if (i == ROW_BLUETOOTH) {
-            // Shown for what's coming: there's no Bluetooth audio yet, so it stays off.
-            lv_obj_t *sw = add_switch(row);
-            lv_obj_add_state(sw, LV_STATE_DISABLED);
-            lv_obj_t *note = ui_label(row, &ui_font_14, COLOR_MUTED, 0);
-            lv_label_set_text(note, "coming soon");
-            lv_obj_align_to(note, sw, LV_ALIGN_OUT_LEFT_MID, -8, 0);
         } else {
             add_value(row, i);
             if (i < ROW_ROTATE) {
                 lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
                 lv_obj_set_ext_click_area(row, 2);
-                lv_obj_add_event_cb(row, on_cycle_row, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+                lv_obj_add_event_cb(row, i == ROW_HEADSET ? on_headset_row : on_cycle_row, LV_EVENT_CLICKED,
+                                    (void *)(intptr_t)i);
             }
         }
     }
